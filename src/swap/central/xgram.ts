@@ -1,8 +1,8 @@
 import {
   asArray,
   asBoolean,
+  asDate,
   asEither,
-  asMaybe,
   asNumber,
   asObject,
   asOptional,
@@ -25,13 +25,13 @@ import {
 } from 'edge-core-js/types'
 
 import { xgram as xgramMapping } from '../../mappings/xgram'
+import { EdgeCurrencyPluginId } from '../../util/edgeCurrencyPluginIds'
 import {
-  ChainCodeTickerMap,
   checkWhitelistedMainnetCodes,
   CurrencyPluginIdSwapChainCodeMap,
   denominationToNative,
   ensureInFuture,
-  getChainAndTokenCodes,
+  getContractAddresses,
   getMaxSwappable,
   makeSwapPluginQuote,
   mapToRecord,
@@ -56,23 +56,19 @@ const asInitOptions = asObject({
 })
 
 const orderUri = 'https://xgram.io/exchange/order?id='
-const uri = 'https://xgram.io/api/v1/'
-const newExchange = 'launch-new-exchange'
-const newRevExchange = 'launch-new-payment-exchange'
-let lastUpdated = 0
-const EXPIRATION = 1000 * 60 * 60
+const uri = 'https://xgram.io/api/v2/'
+const newExchange = 'launch-new-exchange-edge'
+const newRevExchange = 'launch-new-payment-exchange-edge'
 
 export const MAINNET_CODE_TRANSCRIPTION: CurrencyPluginIdSwapChainCodeMap = mapToRecord(
   xgramMapping
 )
 
-let chainCodeTickerMap: ChainCodeTickerMap = new Map()
-
 const swapType: FlowType = 'fixed'
 type FlowType = 'fixed' | 'float'
 
 export function makeXgramPlugin(opts: EdgeCorePluginOptions): EdgeSwapPlugin {
-  const { io, log } = opts
+  const { io } = opts
 
   const fetchCors = io.fetch
   const { apiKey } = asInitOptions(opts.initOptions)
@@ -80,47 +76,6 @@ export function makeXgramPlugin(opts: EdgeCorePluginOptions): EdgeSwapPlugin {
   const headers = {
     'Content-Type': 'application/json',
     'x-api-key': apiKey
-  }
-
-  async function fetchSupportedAssets(): Promise<void> {
-    if (lastUpdated > Date.now() - EXPIRATION && lastUpdated !== 0) return
-    try {
-      const response = await fetchCors(`${uri}list-currency-options`, {
-        headers
-      })
-
-      const json = await response.json()
-      const jsonArr = Object.entries(json).map(([key, data]) => ({
-        ...(data as object),
-        coinName: key
-      }))
-      const assets = asXgramAssets(jsonArr)
-      const chaincodeArray = Object.values(MAINNET_CODE_TRANSCRIPTION)
-        .filter((v): v is string => v != null)
-        .map(v => v.toLowerCase())
-      const out: ChainCodeTickerMap = new Map()
-
-      for (const asset of assets) {
-        const chain = asset.network.toLowerCase()
-        if (chaincodeArray.includes(chain)) {
-          const tokenCodes = out.get(chain) ?? []
-
-          tokenCodes.push({
-            tokenCode: asset.coinName,
-            contractAddress:
-              asset.contract != null && asset.contract !== ''
-                ? asset.contract
-                : null
-          })
-          out.set(chain, tokenCodes)
-        }
-      }
-
-      chainCodeTickerMap = out
-      lastUpdated = Date.now()
-    } catch (e) {
-      log.warn('Xgram: Error updating supported assets', e)
-    }
   }
 
   const fetchSwapQuoteInner = async (
@@ -134,35 +89,34 @@ export function makeXgramPlugin(opts: EdgeCorePluginOptions): EdgeSwapPlugin {
       getAddress(toWallet)
     ])
 
-    const xgramCodes = await getChainAndTokenCodes(
-      request,
-      swapInfo,
-      chainCodeTickerMap,
-      MAINNET_CODE_TRANSCRIPTION
+    const { fromContractAddress, toContractAddress } = getContractAddresses(
+      request
     )
+
+    const fromNetwork =
+      MAINNET_CODE_TRANSCRIPTION[
+        fromWallet.currencyInfo.pluginId as EdgeCurrencyPluginId
+      ] ?? ''
+    const toNetwork =
+      MAINNET_CODE_TRANSCRIPTION[
+        toWallet.currencyInfo.pluginId as EdgeCurrencyPluginId
+      ] ?? ''
 
     async function createOrder(
       isSelling: boolean,
       largeDenomAmount: string
     ): Promise<XgramResponse> {
-      const orderBody = {
-        fromCurrency: xgramCodes.fromCurrencyCode,
-        toCurrency: xgramCodes.toCurrencyCode,
-        fromAmount: isSelling ? largeDenomAmount : '',
-        toAmount: isSelling ? '' : largeDenomAmount,
-        address: toAddress,
-        refundAddress: fromAddress
-      }
-
       const createExchangeUrl = isSelling ? newExchange : newRevExchange
 
       const qs = new URLSearchParams({
         toAddress: String(toAddress),
         refundAddress: String(fromAddress),
-        fromCcy: orderBody.fromCurrency,
-        toCcy: orderBody.toCurrency,
         ccyAmount: largeDenomAmount,
-        type: swapType
+        type: swapType,
+        fromContractAddress,
+        toContractAddress,
+        fromNetwork,
+        toNetwork
       }).toString()
 
       const orderResponse = await fetchCors(
@@ -178,7 +132,6 @@ export function makeXgramPlugin(opts: EdgeCorePluginOptions): EdgeSwapPlugin {
 
       const orderResponseJson = await orderResponse.json()
       const quoteFor = request?.quoteFor === 'from' ? 'from' : 'to'
-
       const quoteReply = asTemplateQuoteReply(orderResponseJson)
 
       if ('errors' in quoteReply) {
@@ -216,23 +169,13 @@ export function makeXgramPlugin(opts: EdgeCorePluginOptions): EdgeSwapPlugin {
         throw new Error('Xgram create order error')
       }
 
-      let parsedValidUntil: Date | null = null
-      if (orderResponseJson.expiresAt != null) {
-        const maybe = new Date(orderResponseJson.expiresAt)
-        if (!Number.isNaN(maybe.getTime())) parsedValidUntil = maybe
-      }
-
       return {
-        id: orderResponseJson.id,
-        validUntil: parsedValidUntil,
-        fromAmount: isSelling
-          ? orderBody.fromAmount
-          : orderResponseJson.ccyAmountFrom,
-        toAmount: isSelling
-          ? orderResponseJson.ccyAmountToExpected
-          : orderBody.toAmount,
-        payinAddress: orderResponseJson.depositAddress,
-        payinExtraId: orderResponseJson.depositTag
+        id: quoteReply.id,
+        validUntil: quoteReply.expiresAt,
+        fromAmount: quoteReply.ccyAmountFrom,
+        toAmount: quoteReply.ccyAmountToExpected.toString(),
+        payinAddress: quoteReply.depositAddress,
+        payinExtraId: quoteReply.depositTag
       }
     }
 
@@ -339,8 +282,6 @@ export function makeXgramPlugin(opts: EdgeCorePluginOptions): EdgeSwapPlugin {
     ): Promise<EdgeSwapQuote> {
       const request = convertRequest(req)
 
-      await fetchSupportedAssets()
-
       checkWhitelistedMainnetCodes(
         MAINNET_CODE_TRANSCRIPTION,
         request,
@@ -376,15 +317,6 @@ interface XgramResponse {
   validUntil?: Date | null
 }
 
-const asXgramAssets = asArray(
-  asObject({
-    coinName: asString,
-    network: asString,
-    available: asBoolean,
-    contract: asMaybe(asString, null)
-  })
-)
-
 const asTemplateLimitError = asObject({
   code: asValue('BELOW_LIMIT', 'ABOVE_LIMIT'),
   destinationAmountLimit: asString,
@@ -415,6 +347,8 @@ const asTemplateQuote = asObject({
   depositAddress: asString,
   depositTag: asString,
   id: asString,
-  result: asBoolean
+  result: asBoolean,
+  expiresAt: asDate,
+  ccyAmountFrom: asString
 })
 const asTemplateQuoteReply = asEither(asTemplateQuote, asTemplateError)
