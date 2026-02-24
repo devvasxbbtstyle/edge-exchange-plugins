@@ -12,10 +12,12 @@ import {
   EdgeCorePluginOptions,
   EdgeMemo,
   EdgeSpendInfo,
+  EdgeSwapApproveOptions,
   EdgeSwapInfo,
   EdgeSwapPlugin,
   EdgeSwapQuote,
   EdgeSwapRequest,
+  EdgeSwapResult,
   SwapAboveLimitError,
   SwapBelowLimitError,
   SwapCurrencyError,
@@ -27,10 +29,8 @@ import { EdgeCurrencyPluginId } from '../../util/edgeCurrencyPluginIds'
 import {
   checkWhitelistedMainnetCodes,
   CurrencyPluginIdSwapChainCodeMap,
-  ensureInFuture,
   getContractAddresses,
   getMaxSwappable,
-  makeSwapPluginQuote,
   mapToRecord,
   SwapOrder
 } from '../../util/swapHelpers'
@@ -73,6 +73,45 @@ const addressTypeMap: StringMap = {
 const swapType = 'fixed' as const
 const ccyAmountLimitRegex = /ccyAmount must be ([><])\s*([\d.]+)/
 
+function throwOnXgramErrors(
+  errors: ReturnType<typeof asXgramError>['errors'],
+  request: EdgeSwapRequestPlugin,
+  isSelling: boolean,
+  quoteFor: 'from' | 'to',
+  fallbackMsg: string
+): never {
+  if (errors.find(error => error.code === 'REGION_UNSUPPORTED') != null) {
+    throw new SwapPermissionError(swapInfo, 'geoRestriction')
+  }
+  if (errors.find(error => error.code === 'CURRENCY_UNSUPPORTED') != null) {
+    throw new SwapCurrencyError(swapInfo, request)
+  }
+  const limitError = errors
+    .map(e => asMaybe(asXgramLimitError)(e))
+    .find(e => e != null)
+  if (limitError?.code === 'BELOW_LIMIT') {
+    const nativeLimit = denominationToNative(
+      isSelling ? request.fromWallet : request.toWallet,
+      isSelling
+        ? limitError.sourceAmountLimit
+        : limitError.destinationAmountLimit,
+      isSelling ? request.fromTokenId : request.toTokenId
+    )
+    throw new SwapBelowLimitError(swapInfo, nativeLimit, quoteFor)
+  }
+  if (limitError?.code === 'ABOVE_LIMIT') {
+    const nativeLimit = denominationToNative(
+      isSelling ? request.fromWallet : request.toWallet,
+      isSelling
+        ? limitError.sourceAmountLimit
+        : limitError.destinationAmountLimit,
+      isSelling ? request.fromTokenId : request.toTokenId
+    )
+    throw new SwapAboveLimitError(swapInfo, nativeLimit, quoteFor)
+  }
+  throw new Error(fallbackMsg)
+}
+
 export function makeXgramPlugin(opts: EdgeCorePluginOptions): EdgeSwapPlugin {
   const { io } = opts
 
@@ -84,236 +123,242 @@ export function makeXgramPlugin(opts: EdgeCorePluginOptions): EdgeSwapPlugin {
     'x-api-key': apiKey
   }
 
+  async function fetchRate(
+    isSelling: boolean,
+    largeDenomAmount: string,
+    ctx: XgramContext,
+    request: EdgeSwapRequestPlugin
+  ): Promise<XgramRate> {
+    const qs = new URLSearchParams({
+      fromNetwork: ctx.fromNetwork,
+      fromContractAddress: ctx.fromContractAddress ?? '',
+      toContractAddress: ctx.toContractAddress ?? '',
+      toNetwork: ctx.toNetwork,
+      ccyAmount: largeDenomAmount
+    }).toString()
+
+    const rateRes = await fetchCors(uri + `retrieve-rate-value?${qs}`, {
+      headers
+    })
+
+    const json = await rateRes.json()
+    const rateReply = asXgramRateResponse(json)
+    const quoteFor = request.quoteFor === 'from' ? 'from' : 'to'
+
+    if ('errors' in rateReply) {
+      throwOnXgramErrors(
+        rateReply.errors,
+        request,
+        isSelling,
+        quoteFor,
+        'Xgram rate error'
+      )
+    }
+
+    if ('error' in rateReply) {
+      const match = ccyAmountLimitRegex.exec(rateReply.error)
+      if (match != null) {
+        const [, direction, limitStr] = match
+        const nativeLimit = denominationToNative(
+          isSelling ? request.fromWallet : request.toWallet,
+          limitStr,
+          isSelling ? request.fromTokenId : request.toTokenId
+        )
+        if (direction === '>') {
+          throw new SwapBelowLimitError(swapInfo, nativeLimit, quoteFor)
+        }
+        throw new SwapAboveLimitError(swapInfo, nativeLimit, quoteFor)
+      }
+      throw new Error(`Xgram: ${rateReply.error}`)
+    }
+
+    return {
+      fromAmount: isSelling ? rateReply.ccyAmountFrom : largeDenomAmount,
+      toAmount: isSelling
+        ? rateReply.ccyAmountToExpected
+        : rateReply.ccyAmountFrom
+    }
+  }
+
+  async function createOrder(
+    isSelling: boolean,
+    largeDenomAmount: string,
+    ctx: XgramContext,
+    request: EdgeSwapRequestPlugin
+  ): Promise<XgramResponse> {
+    const createExchangeUrl = isSelling ? newExchange : newRevExchange
+    const qs = new URLSearchParams({
+      toAddress: String(ctx.toAddress),
+      refundAddress: String(ctx.fromAddress),
+      ccyAmount: largeDenomAmount,
+      type: swapType,
+      fromContractAddress: ctx.fromContractAddress ?? '',
+      toContractAddress: ctx.toContractAddress ?? '',
+      fromNetwork: ctx.fromNetwork,
+      toNetwork: ctx.toNetwork
+    }).toString()
+
+    const orderResponse = await fetchCors(uri + createExchangeUrl + `?${qs}`, {
+      headers
+    })
+
+    if (!orderResponse.ok) {
+      throw new Error('Xgram create order failed')
+    }
+
+    const orderResponseJson = await orderResponse.json()
+    const quoteFor = request.quoteFor === 'from' ? 'from' : 'to'
+    const quoteReply = asXgramQuoteReply(orderResponseJson)
+
+    if ('errors' in quoteReply) {
+      throwOnXgramErrors(
+        quoteReply.errors,
+        request,
+        isSelling,
+        quoteFor,
+        'Xgram create order error'
+      )
+    }
+    if ('error' in quoteReply) {
+      const match = ccyAmountLimitRegex.exec(quoteReply.error)
+      if (match != null) {
+        const [, direction, limitStr] = match
+        const nativeLimit = denominationToNative(
+          isSelling ? request.fromWallet : request.toWallet,
+          limitStr,
+          isSelling ? request.fromTokenId : request.toTokenId
+        )
+        if (direction === '>') {
+          throw new SwapBelowLimitError(swapInfo, nativeLimit, quoteFor)
+        }
+        throw new SwapAboveLimitError(swapInfo, nativeLimit, quoteFor)
+      }
+
+      throw new Error(`Xgram: ${quoteReply.error}`)
+    }
+
+    if (quoteReply.ccyAmountToExpected == null && isSelling) {
+      throw new Error('Xgram quote missing ccyAmountToExpected')
+    }
+
+    return {
+      id: quoteReply.id,
+      validUntil: quoteReply.expiresAt,
+      fromAmount: quoteReply.ccyAmountFrom,
+      toAmount:
+        quoteReply.ccyAmountToExpected != null
+          ? quoteReply.ccyAmountToExpected.toString()
+          : largeDenomAmount,
+      payinAddress: quoteReply.depositAddress,
+      payinExtraId: quoteReply.depositTag
+    }
+  }
+
   const fetchSwapQuoteInner = async (
     request: EdgeSwapRequestPlugin,
-    opts: { promoCode?: string }
+    _opts: { promoCode?: string }
   ): Promise<SwapOrder> => {
     const { fromWallet, toWallet, nativeAmount } = request
 
     const [fromAddress, toAddress] = await Promise.all([
-      getAddress(
-        request.fromWallet,
-        addressTypeMap[request.fromWallet.currencyInfo.pluginId]
-      ),
-      getAddress(
-        request.toWallet,
-        addressTypeMap[request.toWallet.currencyInfo.pluginId]
-      )
+      getAddress(fromWallet, addressTypeMap[fromWallet.currencyInfo.pluginId]),
+      getAddress(toWallet, addressTypeMap[toWallet.currencyInfo.pluginId])
     ])
 
     const { fromContractAddress, toContractAddress } = getContractAddresses(
       request
     )
-
     const fromNetwork =
       MAINNET_CODE_TRANSCRIPTION[
         fromWallet.currencyInfo.pluginId as EdgeCurrencyPluginId
-      ] ?? ''
+        ] ?? ''
     const toNetwork =
       MAINNET_CODE_TRANSCRIPTION[
         toWallet.currencyInfo.pluginId as EdgeCurrencyPluginId
-      ] ?? ''
+        ] ?? ''
 
     if (fromNetwork === '' || toNetwork === '') {
       throw new SwapCurrencyError(swapInfo, request)
     }
 
-    async function createOrder(
-      isSelling: boolean,
-      largeDenomAmount: string
-    ): Promise<XgramResponse> {
-      const createExchangeUrl = isSelling ? newExchange : newRevExchange
-
-      const qs = new URLSearchParams({
-        toAddress: String(toAddress),
-        refundAddress: String(fromAddress),
-        ccyAmount: largeDenomAmount,
-        type: swapType,
-        fromContractAddress: fromContractAddress ?? '',
-        toContractAddress: toContractAddress ?? '',
-        fromNetwork,
-        toNetwork
-      }).toString()
-
-      const orderResponse = await fetchCors(
-        uri + createExchangeUrl + `?${qs}`,
-        {
-          headers
-        }
-      )
-
-      if (!orderResponse.ok) {
-        throw new Error('Xgram create order failed')
-      }
-
-      const orderResponseJson = await orderResponse.json()
-      const quoteFor = request.quoteFor === 'from' ? 'from' : 'to'
-      const quoteReply = asXgramQuoteReply(orderResponseJson)
-
-      if ('errors' in quoteReply) {
-        const errors = quoteReply.errors
-
-        if (errors.find(error => error.code === 'REGION_UNSUPPORTED') != null) {
-          throw new SwapPermissionError(swapInfo, 'geoRestriction')
-        }
-
-        if (
-          errors.find(error => error.code === 'CURRENCY_UNSUPPORTED') != null
-        ) {
-          throw new SwapCurrencyError(swapInfo, request)
-        }
-        const limitError = errors
-          .map(e => asMaybe(asXgramLimitError)(e))
-          .find(e => e != null)
-
-        if (limitError?.code === 'BELOW_LIMIT') {
-          const nativeLimit = denominationToNative(
-            isSelling ? request.fromWallet : request.toWallet,
-            isSelling
-              ? limitError.sourceAmountLimit
-              : limitError.destinationAmountLimit,
-            isSelling ? request.fromTokenId : request.toTokenId
-          )
-
-          throw new SwapBelowLimitError(swapInfo, nativeLimit, quoteFor)
-        }
-        if (limitError?.code === 'ABOVE_LIMIT') {
-          const nativeLimit = denominationToNative(
-            isSelling ? request.fromWallet : request.toWallet,
-            isSelling
-              ? limitError.sourceAmountLimit
-              : limitError.destinationAmountLimit,
-            isSelling ? request.fromTokenId : request.toTokenId
-          )
-          throw new SwapAboveLimitError(swapInfo, nativeLimit, quoteFor)
-        }
-        throw new Error('Xgram create order error')
-      }
-      if ('error' in quoteReply) {
-        const match = ccyAmountLimitRegex.exec(quoteReply.error)
-        if (match != null) {
-          const [, direction, limitStr] = match
-          const nativeLimit = denominationToNative(
-            isSelling ? request.fromWallet : request.toWallet,
-            limitStr,
-            isSelling ? request.fromTokenId : request.toTokenId
-          )
-          if (direction === '>') {
-            throw new SwapBelowLimitError(swapInfo, nativeLimit, quoteFor)
-          }
-          throw new SwapAboveLimitError(swapInfo, nativeLimit, quoteFor)
-        }
-
-        throw new Error(`Xgram: ${quoteReply.error}`)
-      }
-
-      if (quoteReply.ccyAmountToExpected == null && isSelling) {
-        throw new Error('Xgram quote missing ccyAmountToExpected')
-      }
-
-      return {
-        id: quoteReply.id,
-        validUntil: quoteReply.expiresAt,
-        fromAmount: quoteReply.ccyAmountFrom,
-        toAmount:
-          quoteReply.ccyAmountToExpected != null
-            ? quoteReply.ccyAmountToExpected.toString()
-            : largeDenomAmount,
-        payinAddress: quoteReply.depositAddress,
-        payinExtraId: quoteReply.depositTag
-      }
+    const ctx: XgramContext = {
+      fromAddress,
+      toAddress,
+      fromContractAddress,
+      toContractAddress,
+      fromNetwork,
+      toNetwork
     }
 
-    async function swapExchange(isSelling: boolean): Promise<SwapOrder> {
-      const largeDenomAmount = nativeToDenomination(
-        isSelling ? request.fromWallet : request.toWallet,
-        nativeAmount,
-        isSelling ? request.fromTokenId : request.toTokenId
-      )
+    const isSelling = request.quoteFor !== 'to'
+    const largeDenomAmount = nativeToDenomination(
+      isSelling ? fromWallet : toWallet,
+      nativeAmount,
+      isSelling ? request.fromTokenId : request.toTokenId
+    )
 
-      const {
-        fromAmount,
-        toAmount,
-        payinAddress,
-        payinExtraId,
-        id,
-        validUntil
-      } = await createOrder(isSelling, largeDenomAmount)
+    const order = await createOrder(isSelling, largeDenomAmount, ctx, request)
 
-      const fromNativeAmount = denominationToNative(
-        request.fromWallet,
-        fromAmount.toString(),
-        request.fromTokenId
-      )
-      const toNativeAmount = denominationToNative(
-        request.toWallet,
-        toAmount.toString(),
-        request.toTokenId
-      )
+    const fromNativeAmount = denominationToNative(
+      fromWallet,
+      order.fromAmount,
+      request.fromTokenId
+    )
+    const toNativeAmount = denominationToNative(
+      toWallet,
+      order.toAmount,
+      request.toTokenId
+    )
 
-      const memos: EdgeMemo[] =
-        payinExtraId == null || payinExtraId === ''
-          ? []
-          : [
-              {
-                type: memoType(request.fromWallet.currencyInfo.pluginId),
-                value: payinExtraId
-              }
-            ]
-
-      const spendInfo: EdgeSpendInfo = {
-        tokenId: request.fromTokenId,
-        spendTargets: [
+    const memos: EdgeMemo[] =
+      order.payinExtraId == null || order.payinExtraId === ''
+        ? []
+        : [
           {
-            nativeAmount: fromNativeAmount,
-            publicAddress: payinAddress
+            type: memoType(fromWallet.currencyInfo.pluginId),
+            value: order.payinExtraId
           }
-        ],
-        memos,
-        networkFeeOption: 'high',
-        assetAction: {
-          assetActionType: 'swap'
-        },
-        savedAction: {
-          actionType: 'swap',
-          swapInfo,
-          orderId: id,
-          orderUri: orderUri + id,
-          isEstimate: false,
-          toAsset: {
-            pluginId: request.toWallet.currencyInfo.pluginId,
-            tokenId: request.toTokenId,
-            nativeAmount: toNativeAmount
-          },
-          fromAsset: {
-            pluginId: request.fromWallet.currencyInfo.pluginId,
-            tokenId: request.fromTokenId,
-            nativeAmount: fromNativeAmount
-          },
-          payoutAddress: toAddress,
-          payoutWalletId: request.toWallet.id,
-          refundAddress: fromAddress
-        }
-      }
+        ]
 
-      return {
-        request,
-        spendInfo,
+    const spendInfo: EdgeSpendInfo = {
+      tokenId: request.fromTokenId,
+      spendTargets: [
+        {
+          nativeAmount: fromNativeAmount,
+          publicAddress: order.payinAddress
+        }
+      ],
+      memos,
+      networkFeeOption: 'high',
+      assetAction: { assetActionType: 'swap' },
+      savedAction: {
+        actionType: 'swap',
         swapInfo,
-        fromNativeAmount,
-        expirationDate:
-          validUntil != null
-            ? ensureInFuture(validUntil)
-            : new Date(Date.now() + 1000 * 60)
+        orderId: order.id,
+        orderUri: orderUri + order.id,
+        isEstimate: false,
+        toAsset: {
+          pluginId: toWallet.currencyInfo.pluginId,
+          tokenId: request.toTokenId,
+          nativeAmount: toNativeAmount
+        },
+        fromAsset: {
+          pluginId: fromWallet.currencyInfo.pluginId,
+          tokenId: request.fromTokenId,
+          nativeAmount: fromNativeAmount
+        },
+        payoutAddress: toAddress,
+        payoutWalletId: toWallet.id,
+        refundAddress: fromAddress
       }
     }
 
-    const { quoteFor } = request
-
-    if (quoteFor === 'from') {
-      return await swapExchange(true)
-    } else {
-      return await swapExchange(false)
+    return {
+      request,
+      spendInfo,
+      swapInfo,
+      fromNativeAmount,
+      expirationDate: order.validUntil ?? new Date(Date.now() + 1000 * 60)
     }
   }
 
@@ -332,16 +377,180 @@ export function makeXgramPlugin(opts: EdgeCorePluginOptions): EdgeSwapPlugin {
         request,
         swapInfo
       )
+
       const newRequest = await getMaxSwappable(
         fetchSwapQuoteInner,
         request,
         opts
       )
-      const swapOrder = await fetchSwapQuoteInner(newRequest, opts)
-      return await makeSwapPluginQuote(swapOrder)
+
+      const { fromWallet, toWallet, nativeAmount } = newRequest
+
+      const [fromAddress, toAddress] = await Promise.all([
+        getAddress(
+          fromWallet,
+          addressTypeMap[fromWallet.currencyInfo.pluginId]
+        ),
+        getAddress(toWallet, addressTypeMap[toWallet.currencyInfo.pluginId])
+      ])
+
+      const { fromContractAddress, toContractAddress } = getContractAddresses(
+        newRequest
+      )
+      const fromNetwork =
+        MAINNET_CODE_TRANSCRIPTION[
+          fromWallet.currencyInfo.pluginId as EdgeCurrencyPluginId
+          ] ?? ''
+      const toNetwork =
+        MAINNET_CODE_TRANSCRIPTION[
+          toWallet.currencyInfo.pluginId as EdgeCurrencyPluginId
+          ] ?? ''
+
+      if (fromNetwork === '' || toNetwork === '') {
+        throw new SwapCurrencyError(swapInfo, newRequest)
+      }
+
+      const ctx: XgramContext = {
+        fromAddress,
+        toAddress,
+        fromContractAddress,
+        toContractAddress,
+        fromNetwork,
+        toNetwork
+      }
+
+      const isSelling = newRequest.quoteFor !== 'to'
+      const largeDenomAmount = nativeToDenomination(
+        isSelling ? fromWallet : toWallet,
+        nativeAmount,
+        isSelling ? newRequest.fromTokenId : newRequest.toTokenId
+      )
+
+      const rate = await fetchRate(isSelling, largeDenomAmount, ctx, newRequest)
+
+      const fromNativeAmount = denominationToNative(
+        fromWallet,
+        rate.fromAmount,
+        newRequest.fromTokenId
+      )
+      const toNativeAmount = denominationToNative(
+        toWallet,
+        rate.toAmount,
+        newRequest.toTokenId
+      )
+
+      const quote: EdgeSwapQuote = {
+        swapInfo,
+        request: req,
+        pluginId: swapInfo.pluginId,
+        isEstimate: false,
+        fromNativeAmount,
+        toNativeAmount,
+        networkFee: {
+          currencyCode: fromWallet.currencyInfo.currencyCode,
+          nativeAmount: '0',
+          tokenId: null
+        },
+        expirationDate: new Date(Date.now() + 1000 * 60),
+
+        async approve(
+          approveOpts?: EdgeSwapApproveOptions
+        ): Promise<EdgeSwapResult> {
+          const order = await createOrder(
+            isSelling,
+            largeDenomAmount,
+            ctx,
+            newRequest
+          )
+
+          const orderFromNativeAmount = denominationToNative(
+            fromWallet,
+            order.fromAmount.toString(),
+            newRequest.fromTokenId
+          )
+          const orderToNativeAmount = denominationToNative(
+            toWallet,
+            order.toAmount.toString(),
+            newRequest.toTokenId
+          )
+
+          const memos: EdgeMemo[] =
+            order.payinExtraId == null || order.payinExtraId === ''
+              ? []
+              : [
+                {
+                  type: memoType(fromWallet.currencyInfo.pluginId),
+                  value: order.payinExtraId
+                }
+              ]
+
+          const spendInfo: EdgeSpendInfo = {
+            tokenId: newRequest.fromTokenId,
+            spendTargets: [
+              {
+                nativeAmount: orderFromNativeAmount,
+                publicAddress: order.payinAddress
+              }
+            ],
+            memos,
+            networkFeeOption: 'high',
+            assetAction: { assetActionType: 'swap' },
+            savedAction: {
+              actionType: 'swap',
+              swapInfo,
+              orderId: order.id,
+              orderUri: orderUri + order.id,
+              isEstimate: false,
+              toAsset: {
+                pluginId: toWallet.currencyInfo.pluginId,
+                tokenId: newRequest.toTokenId,
+                nativeAmount: orderToNativeAmount
+              },
+              fromAsset: {
+                pluginId: fromWallet.currencyInfo.pluginId,
+                tokenId: newRequest.fromTokenId,
+                nativeAmount: orderFromNativeAmount
+              },
+              payoutAddress: toAddress,
+              payoutWalletId: toWallet.id,
+              refundAddress: fromAddress
+            }
+          }
+
+          const tx = await fromWallet.makeSpend(spendInfo)
+          tx.metadata = approveOpts?.metadata ?? {}
+          const signedTx = await fromWallet.signTx(tx)
+          const broadcastedTx = await fromWallet.broadcastTx(signedTx)
+          await fromWallet.saveTx(broadcastedTx)
+
+          return {
+            transaction: broadcastedTx,
+            orderId: order.id,
+            destinationAddress: toAddress
+          }
+        },
+
+        async close(): Promise<void> {}
+      }
+
+      return quote
     }
   }
   return out
+}
+
+interface XgramContext {
+  fromAddress: string
+  toAddress: string
+  fromContractAddress: string | undefined
+  toContractAddress: string | undefined
+  fromNetwork: string
+  toNetwork: string
+}
+
+interface XgramRate {
+  fromAmount: string
+  toAmount: string
 }
 
 interface XgramResponse {
@@ -388,6 +597,15 @@ const asXgramQuote = asObject({
 })
 const asXgramQuoteReply = asEither(
   asXgramQuote,
+  asXgramError,
+  asXgramStringError
+)
+const asXgramRateReply = asObject({
+  ccyAmountFrom: asNumberString,
+  ccyAmountToExpected: asNumberString
+})
+const asXgramRateResponse = asEither(
+  asXgramRateReply,
   asXgramError,
   asXgramStringError
 )
